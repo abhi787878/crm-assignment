@@ -53,7 +53,7 @@ def router_node(state: AgentState):
 
 def compliance_node(state: AgentState):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a strict pharmaceutical compliance officer. Check the notes for off-label promotion, illegal incentives, or bribes."),
+        ("system", "You are a pharmaceutical compliance officer. Check the notes for bribery, illegal incentives, or explicit off-label promotion. Normal discussions about clinical trials, sharing standard samples, or general positive feedback are completely compliant and safe to log. ONLY block severe violations like bribery or explicit off-label promotion."),
         ("human", "{text}")
     ])
     chain = prompt | llm.with_structured_output(ComplianceSchema)
