@@ -1,50 +1,55 @@
 import os
-from typing import TypedDict
-from langgraph.graph import StateGraph, END
+import datetime
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from langgraph.graph import StateGraph, END
+from typing import TypedDict
 
+# Load API Key from .env
 load_dotenv()
 
+# Initialize LLM
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 
-# 1. Schemas
+# 1. State Definition
+class AgentState(TypedDict):
+    text: str
+    db_context: str
+    intent: str
+    is_compliant: bool
+    compliance_reason: str
+    extracted_data: dict
+    query_response: str
+    drafted_email: str
+
+# 2. Schemas
 class IntentSchema(BaseModel):
-    intent: str = Field(description="'log' to record a meeting, 'query' to ask about past data, 'draft' to write a follow-up email.")
+    intent: str = Field(description="'log' to record a meeting, 'edit' to update or fix the last meeting, 'query' to ask about past data, 'draft' to write a follow-up email.")
 
 class ComplianceSchema(BaseModel):
-    is_compliant: bool = Field(description="True if safe. False if it contains off-label promotion, bribery, or compliance risks.")
-    reason: str = Field(description="Explanation of the compliance decision.")
+    is_compliant: str = Field(description="Strictly output the word 'true' if safe, or 'false' if it contains bribery or explicit off-label promotion.")
+    reason: str = Field(description="Reason for the compliance decision.")
 
 class ExtractedInfo(BaseModel):
     hcp_name: str = Field(description="Name of the Healthcare Professional")
-    interaction_type: str = Field(description="e.g., Meeting, Video Call, Email, Phone")
-    interaction_date: str = Field(description="Date of interaction strictly in YYYY-MM-DD format (e.g., '2026-07-09') or ''")
-    interaction_time: str = Field(description="Time of interaction strictly in 24-hour HH:mm format (e.g., '14:00' for 2 PM) or ''")
-    attendees: str = Field(description="Names of people present")
-    topics_discussed: str = Field(description="Key discussion points or products mentioned")
-    materials_shared: str = Field(description="Any documents, brochures, or materials shared")
-    samples_distributed: str = Field(description="Any product samples given")
-    sentiment: str = Field(description="MUST be 'Positive', 'Neutral', or 'Negative'")
-    outcomes: str = Field(description="Key outcomes or agreements")
-    next_steps: str = Field(description="Recommended next steps or follow-ups")
+    interaction_type: str = Field(description="Meeting, Video Call, Phone, or Email")
+    # NEW: Forces the AI to strictly use YYYY-MM-DD so the calendar works
+    interaction_date: str = Field(description="Date of the interaction (MUST be exactly in YYYY-MM-DD format)")
+    interaction_time: str = Field(description="Time of the interaction (e.g., 10:30 AM)")
+    attendees: str = Field(description="Other people present")
+    topics_discussed: str = Field(description="Main topics of conversation")
+    materials_shared: str = Field(description="Documents or brochures given")
+    samples_distributed: str = Field(description="Drug samples given and quantity")
+    sentiment: str = Field(description="Strictly 'Positive', 'Neutral', or 'Negative'")
+    outcomes: str = Field(description="Result of the meeting")
+    next_steps: str = Field(description="Follow-up actions needed")
 
-# 2. Graph State
-class AgentState(TypedDict):
-    text: str
-    intent: str
-    extracted_data: dict
-    db_context: str
-    chat_response: str
-    is_compliant: bool
-    compliance_reason: str
-
-# 3. Nodes
+# 3. Nodes (The 5 Tools)
 def router_node(state: AgentState):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Determine the user's intent: 'log', 'query', or 'draft'."),
+        ("system", "Determine the user's intent: 'log', 'edit', 'query', or 'draft'."),
         ("human", "{text}")
     ])
     chain = prompt | llm.with_structured_output(IntentSchema)
@@ -58,50 +63,45 @@ def compliance_node(state: AgentState):
     ])
     chain = prompt | llm.with_structured_output(ComplianceSchema)
     result = chain.invoke({"text": state["text"]})
-    return {"is_compliant": result.is_compliant, "compliance_reason": result.reason}
+    is_safe = str(result.is_compliant).strip().lower() == "true"
+    return {"is_compliant": is_safe, "compliance_reason": result.reason}
 
 def extractor_node(state: AgentState):
+    # NEW: Grabs the actual real-world date to inject into the AI's brain
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Extract the required fields from the notes. If not mentioned, write 'None'."),
+        ("system", f"Extract the required fields from the notes. Today's date is {today}. Convert relative words like 'today' or 'yesterday' into the exact YYYY-MM-DD format. If the user is editing or updating a previous meeting, use this database history to fill in missing details: {{db_context}}. If a field is not mentioned, write 'None'."),
         ("human", "{text}")
     ])
     chain = prompt | llm.with_structured_output(ExtractedInfo)
-    result = chain.invoke({"text": state["text"]})
+    result = chain.invoke({"text": state["text"], "db_context": state.get("db_context", "")})
     return {"extracted_data": result.model_dump()}
 
 def query_node(state: AgentState):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful CRM assistant. Answer the user's question based ONLY on this database history:\n{db_context}"),
+        ("system", "You are a helpful CRM assistant. Answer the user's question using ONLY this database history context: {db_context}. Be concise and conversational."),
         ("human", "{text}")
     ])
     chain = prompt | llm
-    result = chain.invoke({"db_context": state.get("db_context", "No history available."), "text": state["text"]})
-    return {"chat_response": result.content}
+    result = chain.invoke({"text": state["text"], "db_context": state.get("db_context", "")})
+    return {"query_response": result.content}
 
 def draft_node(state: AgentState):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Draft a professional follow-up email to the healthcare professional based on these notes. Keep it concise and polite."),
+        ("system", "You are a professional medical sales rep. Draft a short, polite follow-up email based on these notes. Do not include subject lines, just the email body."),
         ("human", "{text}")
     ])
     chain = prompt | llm
     result = chain.invoke({"text": state["text"]})
-    return {"chat_response": result.content}
+    return {"drafted_email": result.content}
 
-# 4. Build Graph
-workflow = StateGraph(AgentState)
-workflow.add_node("router", router_node)
-workflow.add_node("compliance", compliance_node)
-workflow.add_node("extractor", extractor_node)
-workflow.add_node("query", query_node)
-workflow.add_node("draft", draft_node)
-
-workflow.set_entry_point("router")
-
-# Routing Logic
+# 4. Routing Logic
 def route_logic(state: AgentState):
-    if state.get("intent") == "log":
+    intent = state.get("intent", "")
+    if intent in ["log", "edit"]:
         return "compliance"
-    elif state.get("intent") == "draft":
+    elif intent == "draft":
         return "draft"
     else:
         return "query"
@@ -109,11 +109,20 @@ def route_logic(state: AgentState):
 def compliance_route(state: AgentState):
     if state.get("is_compliant"):
         return "extractor"
-    else:
-        return "end"
+    return END
 
-workflow.add_conditional_edges("router", route_logic, {"compliance": "compliance", "query": "query", "draft": "draft"})
-workflow.add_conditional_edges("compliance", compliance_route, {"extractor": "extractor", "end": END})
+# 5. Build the Graph
+workflow = StateGraph(AgentState)
+
+workflow.add_node("router", router_node)
+workflow.add_node("compliance", compliance_node)
+workflow.add_node("extractor", extractor_node)
+workflow.add_node("query", query_node)
+workflow.add_node("draft", draft_node)
+
+workflow.set_entry_point("router")
+workflow.add_conditional_edges("router", route_logic)
+workflow.add_conditional_edges("compliance", compliance_route)
 workflow.add_edge("extractor", END)
 workflow.add_edge("query", END)
 workflow.add_edge("draft", END)
