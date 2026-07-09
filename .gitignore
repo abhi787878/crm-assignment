@@ -1,0 +1,11 @@
+# Secret Keys
+.env
+
+# Python
+backend/venv/
+backend/__pycache__/
+
+# React
+frontend/node_modules/
+frontend/build/
+.DS_Store
